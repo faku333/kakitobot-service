@@ -1,9 +1,12 @@
 """Local Twitch chat relay for the project operator."""
 import getpass
+import hashlib
+import re
+import threading
 import json
 import os
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -58,6 +61,29 @@ class Relay:
         return 200, {'status': 'Conectado' if result['is_sent'] else 'Twitch rechazó el mensaje'}
 
 
+class BoardLinks:
+    """A capability-derived name can only be updated by its secret holder."""
+    def __init__(self):self.entries={};self.lock=threading.Lock()
+    def register(self,values):
+        secret=values.get('secret','')
+        if not isinstance(secret,str) or not re.fullmatch(r'[A-Za-z0-9_-]{48,100}',secret):raise ValueError('Identidad inválida')
+        ident=hashlib.sha256(secret.encode()).hexdigest();enabled=values.get('enabled')
+        if type(enabled) is not bool:raise ValueError('Estado inválido')
+        target=values.get('target','')
+        if enabled and not re.fullmatch(r'https://[a-z0-9-]+\.trycloudflare\.com/board/[A-Za-z0-9_-]{32}/',target):raise ValueError('Destino de túnel inválido')
+        with self.lock:
+            now=time.monotonic();self.entries={k:v for k,v in self.entries.items() if v[1]>now}
+            if enabled:
+                if ident not in self.entries and len(self.entries)>=1000:raise ValueError('Servicio ocupado')
+                self.entries[ident]=(target,now+90)
+            else:self.entries.pop(ident,None)
+        return {'id':ident,'active':enabled}
+    def target(self,ident):
+        with self.lock:
+            entry=self.entries.get(ident)
+            return entry[0] if entry and entry[1]>time.monotonic() else ''
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_):
         pass
@@ -71,12 +97,25 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self):
-        if self.path == '/status':
+        match=re.fullmatch(r'/pizarra/([a-f0-9]{64})',self.path)
+        if match:
+            target=self.server.links.target(match[1])
+            if target:
+                self.send_response(302);self.send_header('Location',target);self.send_header('Cache-Control','no-store');self.send_header('Referrer-Policy','no-referrer');self.send_header('Content-Length','0');self.end_headers()
+            else:self.reply(503,{'status':'El streamer no tiene el pizarrón conectado en este momento.'})
+        elif self.path == '/status':
             self.reply(200, {'status': 'Servicio disponible', 'id': self.server.relay.sender})
         else:
             self.reply(404, {})
 
     def do_POST(self):
+        if self.path=='/board/register':
+            try:
+                size=int(self.headers.get('Content-Length','0'))
+                if self.headers.get('Origin') or not 0<size<=2048:raise ValueError('Solicitud inválida')
+                self.reply(200,self.server.links.register(json.loads(self.rfile.read(size))))
+            except (ValueError,TypeError,AttributeError):self.reply(400,{'status':'Registro de enlace inválido'})
+            return
         size = self.headers.get('Content-Length', '')
         token = self.headers.get('Authorization', '').removeprefix('Bearer ')
         if (self.path != '/chat' or self.headers.get('Origin') or not token.isascii()
@@ -88,7 +127,7 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(message, str) or not message.strip() or len(message) > 350:
                 self.reply(400, {'status': 'Mensaje inválido'})
                 return
-            self.reply(*self.server.relay.send(token, message))
+            with self.server.relay_lock:self.reply(*self.server.relay.send(token, message))
         except HTTPError as error:
             status = 'Revisá la autorización del bot y el permiso /mod kakitobot' if error.code in (401, 403) else 'Twitch no pudo publicar el mensaje'
             self.reply(502, {'status': status})
@@ -103,8 +142,9 @@ def main():
         relay.connect()
     except (OSError, ValueError, KeyError, IndexError):
         raise SystemExit('No se pudo conectar a Twitch. Revisá el Client Secret y la conexión.') from None
-    with HTTPServer((os.environ.get('KAKITO_BIND', '127.0.0.1'), int(os.environ.get('PORT', '17435'))), Handler) as server:
+    with ThreadingHTTPServer((os.environ.get('KAKITO_BIND', '127.0.0.1'), int(os.environ.get('PORT', '17435'))), Handler) as server:
         server.relay = relay
+        server.relay_lock=threading.Lock();server.links=BoardLinks()
         print('Servicio KakitoBot disponible.', flush=True)
         server.serve_forever()
 
